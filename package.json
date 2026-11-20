@@ -1,0 +1,16 @@
+{
+  "name": "beboobop-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "deploy": "node index.js --deploy",
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "chrono-node": "^2.10.3",
+    "discord.js": "^14.28.1",
+    "dotenv": "^16.4.5"
+  }
+}
