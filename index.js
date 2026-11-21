@@ -1016,8 +1016,13 @@ function buildDraftCustomizerPayload(draftId, draft, guild = null) {
         inline: true,
       },
       {
-        name: '📖 Sherpa [0]  •  🪑 Fillers [0]',
-        value: '**Sherpa:** *None*\n**Fillers:** *None*',
+        name: '📖 Sherpa [0]',
+        value: '*None*',
+        inline: true,
+      },
+      {
+        name: '🪑 Fillers [0]',
+        value: '*None*',
         inline: true,
       },
       {
@@ -1106,31 +1111,29 @@ function buildEventPayload(eventId, includePublishPing = false, guild = null) {
 
   const capLabel = event.accepted_cap > 0 ? `${accepted.length}/${event.accepted_cap}` : `${accepted.length}`;
 
-  const formatAcceptedCompact = (list) =>
+  const formatNumberedCompact = (list) =>
     list.length > 0
       ? list.map((u, i) => `${i + 1}. <@${u.user_id}>${u.is_sherpa ? ' 📖' : ''}`).join('\n')
       : '*None*';
 
-  const formatInlineRow = (list, movedAware = false) =>
+  const formatBulletCompact = (list) =>
     list.length > 0
-      ? list
-          .map(
-            (u) =>
-              `<@${u.user_id}>${movedAware && u.moved_from_accepted ? ' *(moved)*' : ''}`
-          )
-          .join(', ')
+      ? list.map((u) => `• <@${u.user_id}>`).join('\n')
       : '*None*';
 
-  let acceptedField = formatAcceptedCompact(accepted);
-  if (waitlist.length > 0) {
-    acceptedField += `\n**Waitlist (${waitlist.length}):** ${waitlist
-      .map((u, i) => `${i + 1}. <@${u.user_id}>${u.is_sherpa ? ' 📖' : ''}`)
-      .join(', ')}`;
-  }
+  const formatFillersCompact = (list) =>
+    list.length > 0
+      ? list
+          .map((u, i) => `${i + 1}. <@${u.user_id}>${u.moved_from_accepted ? ' (moved)' : ''}`)
+          .join('\n')
+      : '*None*';
 
-  const sherpaAndFillersRow =
-    `📖 **Sherpa [${sherpas.length}]:** ${formatInlineRow(sherpas)}\n` +
-    `🪑 **Fillers [${fillers.length}]:** ${formatInlineRow(fillers, true)}`;
+  let acceptedField = formatNumberedCompact(accepted);
+  if (waitlist.length > 0) {
+    acceptedField += `\n**Waitlist (${waitlist.length}):**\n${waitlist
+      .map((u, i) => `${i + 1}. <@${u.user_id}>${u.is_sherpa ? ' 📖' : ''}`)
+      .join('\n')}`;
+  }
 
   const embedColor = parseHexColor(event.color_hex) ?? 0x5865f2;
   const effectiveImage = resolveEventImage(event.title, event.image_url);
@@ -1151,13 +1154,18 @@ function buildEventPayload(eventId, includePublishPing = false, guild = null) {
         inline: true,
       },
       {
-        name: '📖 Sherpa & 🪑 Fillers',
-        value: sherpaAndFillersRow,
+        name: `📖 Sherpa [${sherpas.length}]`,
+        value: formatBulletCompact(sherpas),
+        inline: true,
+      },
+      {
+        name: `🪑 Fillers [${fillers.length}]`,
+        value: formatFillersCompact(fillers),
         inline: true,
       },
       {
         name: `🚫 Backed-out [${backedOut.length}]`,
-        value: formatInlineRow(backedOut),
+        value: backedOut.length > 0 ? backedOut.map((u) => `<@${u.user_id}>`).join(', ') : '*None*',
         inline: false,
       }
     )
@@ -1285,7 +1293,6 @@ async function reorderChannelEventsDescending(client, channelId, guild = null, p
 
     const resolvedGuild = guild ?? channel.guild ?? null;
 
-    // Delete existing event messages so they can be re-posted in descending start_unix order
     for (const ev of channelEvents) {
       if (ev.message_id) {
         const oldMsg = await channel.messages.fetch(ev.message_id).catch(() => null);
