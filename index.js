@@ -391,6 +391,34 @@ function isImageAttachment(attachment) {
   return /\.(png|jpe?g|gif|webp|avif)(\?.*)?$/i.test(attachment.name ?? '');
 }
 
+function getActorDisplayName(interactionOrMember, user = null) {
+  const member = interactionOrMember?.member ?? interactionOrMember;
+  const resolvedUser = user ?? interactionOrMember?.user ?? member?.user ?? null;
+  const name =
+    member?.displayName ??
+    resolvedUser?.globalName ??
+    resolvedUser?.username ??
+    null;
+  return name ? String(name).trim() : null;
+}
+
+function escapeMarkdownLinkText(text) {
+  return String(text ?? '')
+    .replace(/\\/g, '\\\\')
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]')
+    .replace(/\r?\n/g, ' ')
+    .trim();
+}
+
+function formatParticipantLabel(signup) {
+  const cleanName = escapeMarkdownLinkText(signup?.display_name);
+  if (cleanName) {
+    return `[${cleanName}](https://discord.com/users/${signup.user_id})`;
+  }
+  return `<@${signup.user_id}>`;
+}
+
 function loadStore() {
   if (!fs.existsSync(DB_FILE)) {
     const initial = { events: {}, signups: {} };
@@ -450,6 +478,15 @@ function setEventMessageAndThread(eventId, messageId, threadId) {
   saveStore(store);
 }
 
+function updateSignupDisplayName(eventId, userId, displayName) {
+  if (!displayName) return;
+  const store = loadStore();
+  const entry = store.signups?.[eventId]?.[userId];
+  if (!entry || entry.display_name === displayName) return;
+  entry.display_name = displayName;
+  saveStore(store);
+}
+
 function getEventWithDetails(eventId) {
   const store = loadStore();
   const event = store.events[eventId];
@@ -488,7 +525,7 @@ function isWithinBackedOutWindow(event, nowUnix = Math.floor(Date.now() / 1000))
   return event.start_unix - nowUnix <= BACKED_OUT_WINDOW_SECONDS;
 }
 
-function handleSignupAction(eventId, action, userId, hasSherpaRole) {
+function handleSignupAction(eventId, action, userId, hasSherpaRole, displayName = null) {
   const store = loadStore();
   const event = store.events[eventId];
   if (!event) return { ok: false, message: 'Event no longer exists.' };
@@ -496,6 +533,7 @@ function handleSignupAction(eventId, action, userId, hasSherpaRole) {
   store.signups[eventId] ??= {};
   const signupsMap = store.signups[eventId];
   const existing = signupsMap[userId];
+  const resolvedName = displayName || existing?.display_name || null;
   const nowUnix = Math.floor(Date.now() / 1000);
   const within30Min = isWithinBackedOutWindow(event, nowUnix);
   let promotedUserId = null;
@@ -508,6 +546,7 @@ function handleSignupAction(eventId, action, userId, hasSherpaRole) {
         existing.status = 'backed_out';
         existing.is_sherpa = 0;
         existing.moved_from_accepted = false;
+        if (resolvedName) existing.display_name = resolvedName;
       } else {
         delete signupsMap[userId];
       }
@@ -536,6 +575,7 @@ function handleSignupAction(eventId, action, userId, hasSherpaRole) {
     signupsMap[userId] = {
       event_id: eventId,
       user_id: userId,
+      display_name: resolvedName,
       status: targetStatus,
       is_sherpa: sherpaFlag,
       moved_from_accepted: false,
@@ -570,6 +610,7 @@ function handleSignupAction(eventId, action, userId, hasSherpaRole) {
     signupsMap[userId] = {
       event_id: eventId,
       user_id: userId,
+      display_name: resolvedName,
       status: 'fillers',
       is_sherpa: 0,
       moved_from_accepted: shouldMarkMoved,
@@ -594,7 +635,7 @@ function handleSignupAction(eventId, action, userId, hasSherpaRole) {
   return { ok: false, message: 'Unknown signup action.' };
 }
 
-function adminAddUserToSlot(eventId, targetUserId, targetSlot, targetHasSherpaRole) {
+function adminAddUserToSlot(eventId, targetUserId, targetSlot, targetHasSherpaRole, targetDisplayName = null) {
   const store = loadStore();
   const event = store.events[eventId];
   if (!event) return { ok: false, message: 'Event no longer exists.' };
@@ -602,6 +643,7 @@ function adminAddUserToSlot(eventId, targetUserId, targetSlot, targetHasSherpaRo
   store.signups[eventId] ??= {};
   const signupsMap = store.signups[eventId];
   const existing = signupsMap[targetUserId];
+  const resolvedName = targetDisplayName || existing?.display_name || null;
   let promotedUserId = null;
 
   if (targetSlot === 'fillers') {
@@ -611,6 +653,7 @@ function adminAddUserToSlot(eventId, targetUserId, targetSlot, targetHasSherpaRo
     signupsMap[targetUserId] = {
       event_id: eventId,
       user_id: targetUserId,
+      display_name: resolvedName,
       status: 'fillers',
       is_sherpa: 0,
       moved_from_accepted: shouldMarkMoved,
@@ -633,6 +676,10 @@ function adminAddUserToSlot(eventId, targetUserId, targetSlot, targetHasSherpaRo
 
   // Default / 'accepted' slot
   if (existing?.status === 'accepted') {
+    if (resolvedName && existing.display_name !== resolvedName) {
+      existing.display_name = resolvedName;
+      saveStore(store);
+    }
     return { ok: true, message: `<@${targetUserId}> is already in **Accepted**.`, promotedUserId: null };
   }
 
@@ -644,6 +691,7 @@ function adminAddUserToSlot(eventId, targetUserId, targetSlot, targetHasSherpaRo
   signupsMap[targetUserId] = {
     event_id: eventId,
     user_id: targetUserId,
+    display_name: resolvedName,
     status: resolvedStatus,
     is_sherpa: sherpaFlag,
     moved_from_accepted: false,
@@ -1113,25 +1161,25 @@ function buildEventPayload(eventId, includePublishPing = false, guild = null) {
 
   const formatNumberedCompact = (list) =>
     list.length > 0
-      ? list.map((u, i) => `${i + 1}. <@${u.user_id}>${u.is_sherpa ? ' 📖' : ''}`).join('\n')
+      ? list.map((u, i) => `${i + 1}. ${formatParticipantLabel(u)}${u.is_sherpa ? ' 📖' : ''}`).join('\n')
       : '*None*';
 
   const formatBulletCompact = (list) =>
     list.length > 0
-      ? list.map((u) => `• <@${u.user_id}>`).join('\n')
+      ? list.map((u) => `• ${formatParticipantLabel(u)}`).join('\n')
       : '*None*';
 
   const formatFillersCompact = (list) =>
     list.length > 0
       ? list
-          .map((u, i) => `${i + 1}. <@${u.user_id}>${u.moved_from_accepted ? ' (moved)' : ''}`)
+          .map((u, i) => `${i + 1}. ${formatParticipantLabel(u)}${u.moved_from_accepted ? ' (moved)' : ''}`)
           .join('\n')
       : '*None*';
 
   let acceptedField = formatNumberedCompact(accepted);
   if (waitlist.length > 0) {
     acceptedField += `\n**Waitlist (${waitlist.length}):**\n${waitlist
-      .map((u, i) => `${i + 1}. <@${u.user_id}>${u.is_sherpa ? ' 📖' : ''}`)
+      .map((u, i) => `${i + 1}. ${formatParticipantLabel(u)}${u.is_sherpa ? ' 📖' : ''}`)
       .join('\n')}`;
   }
 
@@ -1165,7 +1213,7 @@ function buildEventPayload(eventId, includePublishPing = false, guild = null) {
       },
       {
         name: `🚫 Backed-out [${backedOut.length}]`,
-        value: backedOut.length > 0 ? backedOut.map((u) => `<@${u.user_id}>`).join(', ') : '*None*',
+        value: backedOut.length > 0 ? backedOut.map((u) => formatParticipantLabel(u)).join(', ') : '*None*',
         inline: false,
       }
     )
@@ -1664,12 +1712,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const targetMember =
       interaction.guild?.members?.cache.get(targetUserId) ??
       (await interaction.guild?.members?.fetch(targetUserId).catch(() => null));
+    const targetUser = interaction.users?.get(targetUserId) ?? targetMember?.user ?? null;
+    const targetDisplayName = getActorDisplayName(targetMember, targetUser);
     const targetHasSherpaRole = memberHasSherpaRole(targetMember);
 
     const stateKey = `${eventId}:${interaction.user.id}`;
     const selectedSlot = pendingAttendeeAdds.get(stateKey) ?? 'accepted';
 
-    const res = adminAddUserToSlot(eventId, targetUserId, selectedSlot, targetHasSherpaRole);
+    const res = adminAddUserToSlot(
+      eventId,
+      targetUserId,
+      selectedSlot,
+      targetHasSherpaRole,
+      targetDisplayName
+    );
     if (!res.ok) {
       await interaction.reply({ content: res.message, flags: MessageFlags.Ephemeral });
       return;
@@ -1961,11 +2017,30 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     const isSherpa = memberHasSherpaRole(interaction.member);
-    const result = handleSignupAction(eventId, action, interaction.user.id, isSherpa);
+    const actorDisplayName = getActorDisplayName(interaction);
+    const result = handleSignupAction(
+      eventId,
+      action,
+      interaction.user.id,
+      isSherpa,
+      actorDisplayName
+    );
 
     if (!result.ok) {
       await interaction.reply({ content: result.message, flags: MessageFlags.Ephemeral });
       return;
+    }
+
+    // Keep any other participants' display names up to date if already cached in guild
+    if (interaction.guild) {
+      const freshData = getEventWithDetails(eventId);
+      for (const s of freshData?.signups ?? []) {
+        if (!s.display_name) {
+          const cachedMember = interaction.guild.members.cache.get(s.user_id);
+          const cachedName = getActorDisplayName(cachedMember, cachedMember?.user ?? null);
+          if (cachedName) updateSignupDisplayName(eventId, s.user_id, cachedName);
+        }
+      }
     }
 
     const updatedPayload = buildEventPayload(eventId, false, interaction.guild);
