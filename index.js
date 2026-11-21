@@ -29,6 +29,7 @@ import {
 // 1. JSON STORAGE & IN-MEMORY DRAFTS
 // ============================================================================
 const DB_FILE = 'events.json';
+const ARCHIVE_FILE = 'archived_events.json';
 const DEFAULT_TIMEZONE = 'Europe/London';
 const AUTO_THREAD_LEAD_MINUTES = 15;
 const BACKED_OUT_WINDOW_SECONDS = 30 * 60;
@@ -468,6 +469,48 @@ function deleteEventRecord(eventId) {
   return ev;
 }
 
+function loadArchiveStore() {
+  if (!fs.existsSync(ARCHIVE_FILE)) {
+    const initial = { archived: [] };
+    fs.writeFileSync(ARCHIVE_FILE, JSON.stringify(initial, null, 2));
+    return initial;
+  }
+  try {
+    return JSON.parse(fs.readFileSync(ARCHIVE_FILE, 'utf8'));
+  } catch {
+    return { archived: [] };
+  }
+}
+
+function saveArchiveStore(archiveStore) {
+  fs.writeFileSync(ARCHIVE_FILE, JSON.stringify(archiveStore, null, 2));
+}
+
+function archiveEventRecord(eventId, completedByUserId = null) {
+  const store = loadStore();
+  const ev = store.events[eventId];
+  if (!ev) return null;
+
+  const eventSignups = store.signups[eventId] ?? {};
+  const archiveStore = loadArchiveStore();
+  const archivedEntry = {
+    ...ev,
+    status: 'completed',
+    completed_at: Math.floor(Date.now() / 1000),
+    completed_by: completedByUserId ?? ev.host_id,
+    signups: Object.values(eventSignups),
+  };
+
+  archiveStore.archived.unshift(archivedEntry);
+  saveArchiveStore(archiveStore);
+
+  delete store.events[eventId];
+  delete store.signups[eventId];
+  saveStore(store);
+
+  return archivedEntry;
+}
+
 function setEventMessageAndThread(eventId, messageId, threadId) {
   const store = loadStore();
   if (!store.events[eventId]) return;
@@ -500,6 +543,15 @@ function getEventWithDetails(eventId) {
 function hasEventsInChannel(channelId) {
   const store = loadStore();
   return Object.values(store.events).some((ev) => ev.channel_id === channelId);
+}
+
+function getEventChannelIds() {
+  const store = loadStore();
+  return new Set(
+    Object.values(store.events)
+      .map((ev) => ev.channel_id)
+      .filter(Boolean)
+  );
 }
 
 function promoteNextWaitlist(store, eventId) {
@@ -1001,10 +1053,11 @@ function buildAppearanceModal(draft) {
 }
 
 function buildAttendeeManagerPayload(eventId, eventTitle, selectedSlot = 'accepted') {
+  const isRemove = selectedSlot === 'remove';
   const slotRow = new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId(`attendees:${eventId}:slot`)
-      .setPlaceholder('Choose destination group')
+      .setPlaceholder('Choose action or group')
       .addOptions(
         {
           label: 'Accepted (or Waitlist if full)',
@@ -1017,6 +1070,12 @@ function buildAttendeeManagerPayload(eventId, eventTitle, selectedSlot = 'accept
           value: 'fillers',
           emoji: '🪑',
           default: selectedSlot === 'fillers',
+        },
+        {
+          label: 'Remove from Event',
+          value: 'remove',
+          emoji: '❌',
+          default: isRemove,
         }
       )
   );
@@ -1025,7 +1084,9 @@ function buildAttendeeManagerPayload(eventId, eventTitle, selectedSlot = 'accept
     new UserSelectMenuBuilder()
       .setCustomId(`attendees:${eventId}:add_user`)
       .setPlaceholder(
-        selectedSlot === 'fillers'
+        isRemove
+          ? 'Select a member to remove from Accepted or Fillers...'
+          : selectedSlot === 'fillers'
           ? 'Select a member to add to Fillers...'
           : 'Select a member to add to Accepted...'
       )
@@ -1036,7 +1097,9 @@ function buildAttendeeManagerPayload(eventId, eventTitle, selectedSlot = 'accept
   return {
     content:
       `**Manage Attendees — ${eventTitle}**\n` +
-      `Pick whether to add a server member to **Accepted** or **Fillers**, then choose the member below:`,
+      (isRemove
+        ? 'Choose a member below to **remove** them from **Accepted**, **Fillers**, or the event:'
+        : 'Pick whether to add a server member to **Accepted** or **Fillers** (or switch to **Remove from Event**), then choose the member below:'),
     components: [slotRow, userRow],
   };
 }
@@ -1248,6 +1311,11 @@ function buildEventPayload(eventId, includePublishPing = false, guild = null) {
       .setEmoji('✏️')
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
+      .setCustomId(`manage:${event.id}:complete`)
+      .setLabel('Complete Event')
+      .setEmoji('✅')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
       .setCustomId(`manage:${event.id}:delete`)
       .setLabel('Delete Event')
       .setEmoji('🗑️')
@@ -1284,38 +1352,59 @@ function buildCreateEventPromptPayload() {
   };
 }
 
+async function cleanupDuplicateCreatePromptsInChannel(channel, clientUserId, keepMessageId = null) {
+  if (!channel?.isTextBased()) return;
+  const recentMessages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+  if (!recentMessages) return;
+
+  for (const [msgId, msg] of recentMessages) {
+    if (msg.author?.id !== clientUserId) continue;
+    const isPrompt = msg.components?.some((row) =>
+      row.components?.some((comp) => comp.customId === CREATE_EVENT_BUTTON_ID)
+    );
+    if (!isPrompt) continue;
+    if (keepMessageId && msgId === keepMessageId) continue;
+    await msg.delete().catch(() => {});
+  }
+}
+
 async function refreshCreateEventPromptAtBottom(client, channelId, guild = null) {
   if (!channelId) return;
 
-  if (!hasEventsInChannel(channelId)) {
-    const existingPromptId = channelPromptMessages.get(channelId);
-    if (existingPromptId) {
-      const channel = await client.channels.fetch(channelId).catch(() => null);
-      if (channel?.isTextBased()) {
-        const oldPrompt = await channel.messages.fetch(existingPromptId).catch(() => null);
+  const prevTask = channelSortQueues.get(channelId) ?? Promise.resolve();
+  const nextTask = prevTask.catch(() => {}).then(async () => {
+    const channel =
+      guild?.channels?.cache.get(channelId) ??
+      (await client.channels.fetch(channelId).catch(() => null));
+    if (!channel || !channel.isTextBased()) return;
+
+    const trackedPromptId = channelPromptMessages.get(channelId) ?? null;
+
+    if (!hasEventsInChannel(channelId)) {
+      if (trackedPromptId) {
+        const oldPrompt = await channel.messages.fetch(trackedPromptId).catch(() => null);
         if (oldPrompt) await oldPrompt.delete().catch(() => {});
+        channelPromptMessages.delete(channelId);
       }
+      await cleanupDuplicateCreatePromptsInChannel(channel, client.user?.id, null);
+      return;
+    }
+
+    if (trackedPromptId) {
+      const oldPrompt = await channel.messages.fetch(trackedPromptId).catch(() => null);
+      if (oldPrompt) await oldPrompt.delete().catch(() => {});
       channelPromptMessages.delete(channelId);
     }
-    return;
-  }
 
-  const channel =
-    guild?.channels?.cache.get(channelId) ??
-    (await client.channels.fetch(channelId).catch(() => null));
-  if (!channel || !channel.isTextBased()) return;
+    const promptMsg = await channel.send(buildCreateEventPromptPayload()).catch(() => null);
+    if (promptMsg) {
+      channelPromptMessages.set(channelId, promptMsg.id);
+      await cleanupDuplicateCreatePromptsInChannel(channel, client.user?.id, promptMsg.id);
+    }
+  });
 
-  const existingPromptId = channelPromptMessages.get(channelId);
-  if (existingPromptId) {
-    const oldPrompt = await channel.messages.fetch(existingPromptId).catch(() => null);
-    if (oldPrompt) await oldPrompt.delete().catch(() => {});
-    channelPromptMessages.delete(channelId);
-  }
-
-  const promptMsg = await channel.send(buildCreateEventPromptPayload()).catch(() => null);
-  if (promptMsg) {
-    channelPromptMessages.set(channelId, promptMsg.id);
-  }
+  channelSortQueues.set(channelId, nextTask);
+  await nextTask;
 }
 
 // Descending order by start_unix: latest start time at top, soonest start time at bottom
@@ -1329,17 +1418,23 @@ async function reorderChannelEventsDescending(client, channelId, guild = null, p
       .filter((ev) => ev.channel_id === channelId)
       .sort((a, b) => b.start_unix - a.start_unix || a.created_at - b.created_at);
 
-    if (channelEvents.length === 0) {
-      await refreshCreateEventPromptAtBottom(client, channelId, guild);
-      return;
-    }
-
     const channel =
       guild?.channels?.cache.get(channelId) ??
       (await client.channels.fetch(channelId).catch(() => null));
     if (!channel || !channel.isTextBased()) return;
 
     const resolvedGuild = guild ?? channel.guild ?? null;
+
+    if (channelEvents.length === 0) {
+      const trackedPromptId = channelPromptMessages.get(channelId) ?? null;
+      if (trackedPromptId) {
+        const oldPrompt = await channel.messages.fetch(trackedPromptId).catch(() => null);
+        if (oldPrompt) await oldPrompt.delete().catch(() => {});
+        channelPromptMessages.delete(channelId);
+      }
+      await cleanupDuplicateCreatePromptsInChannel(channel, client.user?.id, null);
+      return;
+    }
 
     for (const ev of channelEvents) {
       if (ev.message_id) {
@@ -1359,7 +1454,18 @@ async function reorderChannelEventsDescending(client, channelId, guild = null, p
       }
     }
 
-    await refreshCreateEventPromptAtBottom(client, channelId, resolvedGuild);
+    const trackedPromptId = channelPromptMessages.get(channelId) ?? null;
+    if (trackedPromptId) {
+      const oldPrompt = await channel.messages.fetch(trackedPromptId).catch(() => null);
+      if (oldPrompt) await oldPrompt.delete().catch(() => {});
+      channelPromptMessages.delete(channelId);
+    }
+
+    const promptMsg = await channel.send(buildCreateEventPromptPayload()).catch(() => null);
+    if (promptMsg) {
+      channelPromptMessages.set(channelId, promptMsg.id);
+      await cleanupDuplicateCreatePromptsInChannel(channel, client.user?.id, promptMsg.id);
+    }
   });
 
   channelSortQueues.set(channelId, nextTask);
@@ -1474,7 +1580,7 @@ client.on('error', (err) => {
 
 client.on(Events.MessageCreate, async (message) => {
   if (!message.guild || !message.channel?.isTextBased()) return;
-  if (message.author.id === client.user.id) return;
+  if (message.author?.id === client.user?.id) return;
   if (!hasEventsInChannel(message.channel.id)) return;
 
   await refreshCreateEventPromptAtBottom(client, message.channel.id, message.guild);
@@ -1483,13 +1589,8 @@ client.on(Events.MessageCreate, async (message) => {
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
 
-  const store = loadStore();
-  const activeChannelIds = new Set(
-    Object.values(store.events)
-      .map((ev) => ev.channel_id)
-      .filter(Boolean)
-  );
-  for (const chId of activeChannelIds) {
+  const activeChannels = getEventChannelIds();
+  for (const chId of activeChannels) {
     await reorderChannelEventsDescending(client, chId);
   }
 
@@ -1511,7 +1612,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     return;
   }
 
-  // Quick "Create Event" button at bottom of channel -> opens details modal
+  // Quick "Create Event" button at bottom of events channel -> opens details modal
   if (interaction.isButton() && interaction.customId === CREATE_EVENT_BUTTON_ID) {
     await interaction.showModal(buildEventDetailsModal());
     return;
@@ -1683,7 +1784,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (control === 'slot') {
-      const chosenSlot = interaction.values[0] === 'fillers' ? 'fillers' : 'accepted';
+      const rawChoice = interaction.values[0];
+      const chosenSlot =
+        rawChoice === 'fillers' ? 'fillers' : rawChoice === 'remove' ? 'remove' : 'accepted';
       pendingAttendeeAdds.set(`${eventId}:${interaction.user.id}`, chosenSlot);
       await interaction.update(buildAttendeeManagerPayload(eventId, data.event.title, chosenSlot));
     }
@@ -1719,13 +1822,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const stateKey = `${eventId}:${interaction.user.id}`;
     const selectedSlot = pendingAttendeeAdds.get(stateKey) ?? 'accepted';
 
-    const res = adminAddUserToSlot(
-      eventId,
-      targetUserId,
-      selectedSlot,
-      targetHasSherpaRole,
-      targetDisplayName
-    );
+    const res =
+      selectedSlot === 'remove'
+        ? adminRemoveUser(eventId, targetUserId)
+        : adminAddUserToSlot(
+            eventId,
+            targetUserId,
+            selectedSlot,
+            targetHasSherpaRole,
+            targetDisplayName
+          );
     if (!res.ok) {
       await interaction.reply({ content: res.message, flags: MessageFlags.Ephemeral });
       return;
@@ -1894,6 +2000,76 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (action === 'edit') {
       await interaction.showModal(buildPublishedEditModal(data.event));
+      return;
+    }
+
+    if (action === 'complete') {
+      const confirmRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`manage:${eventId}:confirm_complete`)
+          .setLabel('Yes, Mark Complete & Archive')
+          .setEmoji('✅')
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`manage:${eventId}:cancel_complete`)
+          .setLabel('Cancel')
+          .setStyle(ButtonStyle.Secondary)
+      );
+
+      await interaction.reply({
+        content: `Mark **${data.event.title}** as **complete**? This will save it to \`${ARCHIVE_FILE}\`, archive & lock any lobby thread, and remove the active card from the channel.`,
+        components: [confirmRow],
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (action === 'cancel_complete') {
+      await interaction.update({
+        content: `Completion cancelled — **${data.event.title}** remains active.`,
+        components: [],
+      });
+      return;
+    }
+
+    if (action === 'confirm_complete') {
+      const archived = archiveEventRecord(eventId, interaction.user.id);
+      if (!archived) {
+        await interaction.update({
+          content: 'This event no longer exists or was already archived.',
+          components: [],
+        });
+        return;
+      }
+
+      const channel = await client.channels.fetch(archived.channel_id).catch(() => null);
+
+      if (archived.thread_id && channel) {
+        const thread =
+          channel.threads?.cache.get(archived.thread_id) ??
+          (await client.channels.fetch(archived.thread_id).catch(() => null));
+        if (thread?.isThread()) {
+          await thread
+            .send(`📦 **${archived.title}** has been marked as **Complete** and auto-archived.`)
+            .catch(() => {});
+          await thread.setArchived(true, 'Event marked as complete').catch(() => {});
+          await thread.setLocked(true, 'Event marked as complete').catch(() => {});
+        }
+      }
+
+      if (archived.message_id && channel?.isTextBased()) {
+        const eventMsg = await channel.messages.fetch(archived.message_id).catch(() => null);
+        if (eventMsg) {
+          await eventMsg.delete().catch(() => {});
+        }
+      }
+
+      await reorderChannelEventsDescending(client, archived.channel_id, interaction.guild);
+
+      await interaction.update({
+        content: `✅ Marked **${archived.title}** as **Complete** and auto-archived it.`,
+        components: [],
+      });
       return;
     }
 
