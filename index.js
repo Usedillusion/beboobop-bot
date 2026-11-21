@@ -34,8 +34,11 @@ const AUTO_THREAD_LEAD_MINUTES = 15;
 const BACKED_OUT_WINDOW_SECONDS = 30 * 60;
 const GUIDES_CHANNEL_ID = '1334819504387260467';
 const GUIDES_CHANNEL_URL = 'https://discord.com/channels/1217794860359221368/1334819504387260467';
+const CREATE_EVENT_BUTTON_ID = 'quick_create_event';
 const pendingDrafts = new Map();
 const pendingAttendeeAdds = new Map();
+const channelPromptMessages = new Map();
+const channelSortQueues = new Map();
 
 const COLOR_PRESETS = [
   { label: 'Discord Blurple', value: '5865F2', emoji: '🟦' },
@@ -441,7 +444,9 @@ function setEventMessageAndThread(eventId, messageId, threadId) {
   const store = loadStore();
   if (!store.events[eventId]) return;
   store.events[eventId].message_id = messageId;
-  store.events[eventId].thread_id = threadId ?? null;
+  if (threadId !== undefined) {
+    store.events[eventId].thread_id = threadId ?? null;
+  }
   saveStore(store);
 }
 
@@ -453,6 +458,11 @@ function getEventWithDetails(eventId) {
   const signupsMap = store.signups[eventId] ?? {};
   const signups = Object.values(signupsMap).sort((a, b) => a.signed_up_at - b.signed_up_at);
   return { event, signups };
+}
+
+function hasEventsInChannel(channelId) {
+  const store = loadStore();
+  return Object.values(store.events).some((ev) => ev.channel_id === channelId);
 }
 
 function promoteNextWaitlist(store, eventId) {
@@ -992,32 +1002,27 @@ function buildDraftCustomizerPayload(draftId, draft, guild = null) {
     .setTitle(draft.title)
     .setDescription(
       `${draft.description}\n\n` +
-      `📅 **When:** <t:${draft.startUnix}:F> (<t:${draft.startUnix}:R>)\n\n` +
-      `👑 **Host:** <@${draft.hostId}>\n\n` +
-      `📚 **New to this activity?** Check out <#${GUIDES_CHANNEL_ID}> ([Open Link](${GUIDES_CHANNEL_URL}))\n\n` +
-      `📣 **Publish Tag:** ${formatTagDisplay(guild, draft.tagOption)}\n\n` +
-      `🌍 **Timezone:** \`${draft.timeZone}\` *("${draft.whenRaw}")*\n\n` +
+      `📅 **When:** <t:${draft.startUnix}:F> (<t:${draft.startUnix}:R>)\n` +
+      `👑 **Host:** <@${draft.hostId}>\n` +
+      `📚 **New to this activity?** Check out <#${GUIDES_CHANNEL_ID}> ([Open Link](${GUIDES_CHANNEL_URL}))\n` +
+      `📣 **Publish Tag:** ${formatTagDisplay(guild, draft.tagOption)}\n` +
+      `🌍 **Timezone:** \`${draft.timeZone}\` *("${draft.whenRaw}")*\n` +
       `🧵 **Auto Lobby:** Thread created 15m before start (pings Accepted + Fillers if below cap)`
     )
     .addFields(
       {
         name: `✅ Accepted [${draft.acceptedCap > 0 ? `0/${draft.acceptedCap}` : '0'}]`,
-        value: '\n*None*\n\u200b',
+        value: '*None*',
         inline: true,
       },
       {
-        name: '📖 Sherpa [0]',
-        value: '\n*None*\n\u200b',
+        name: '📖 Sherpa [0]  •  🪑 Fillers [0]',
+        value: '**Sherpa:** *None*\n**Fillers:** *None*',
         inline: true,
       },
       {
-        name: '🪑 Fillers [0]',
-        value: '\n*None*\n\u200b',
-        inline: true,
-      },
-      {
-        name: '\u200b',
-        value: `🚫 **Backed-out [0]**\n\n*None*`,
+        name: '🚫 Backed-out [0]',
+        value: '*None*',
         inline: false,
       }
     )
@@ -1101,29 +1106,31 @@ function buildEventPayload(eventId, includePublishPing = false, guild = null) {
 
   const capLabel = event.accepted_cap > 0 ? `${accepted.length}/${event.accepted_cap}` : `${accepted.length}`;
 
-  const formatNumberedSpaced = (list) =>
+  const formatAcceptedCompact = (list) =>
     list.length > 0
-      ? `\n${list.map((u, i) => `${i + 1}. <@${u.user_id}>${u.is_sherpa ? ' 📖' : ''}`).join('\n\n')}\n\u200b`
-      : '\n*None*\n\u200b';
+      ? list.map((u, i) => `${i + 1}. <@${u.user_id}>${u.is_sherpa ? ' 📖' : ''}`).join('\n')
+      : '*None*';
 
-  const formatBulletSpaced = (list) =>
+  const formatInlineRow = (list, movedAware = false) =>
     list.length > 0
-      ? `\n${list.map((u) => `• <@${u.user_id}>`).join('\n\n')}\n\u200b`
-      : '\n*None*\n\u200b';
+      ? list
+          .map(
+            (u) =>
+              `<@${u.user_id}>${movedAware && u.moved_from_accepted ? ' *(moved)*' : ''}`
+          )
+          .join(', ')
+      : '*None*';
 
-  const formatFillersSpaced = (list) =>
-    list.length > 0
-      ? `\n${list
-          .map((u, i) => `${i + 1}. <@${u.user_id}>${u.moved_from_accepted ? ' (moved)' : ''}`)
-          .join('\n\n')}\n\u200b`
-      : '\n*None*\n\u200b';
-
-  let acceptedField = formatNumberedSpaced(accepted);
+  let acceptedField = formatAcceptedCompact(accepted);
   if (waitlist.length > 0) {
-    acceptedField += `\n**Waitlist (${waitlist.length}):**\n\n${waitlist
+    acceptedField += `\n**Waitlist (${waitlist.length}):** ${waitlist
       .map((u, i) => `${i + 1}. <@${u.user_id}>${u.is_sherpa ? ' 📖' : ''}`)
-      .join('\n\n')}\n\u200b`;
+      .join(', ')}`;
   }
+
+  const sherpaAndFillersRow =
+    `📖 **Sherpa [${sherpas.length}]:** ${formatInlineRow(sherpas)}\n` +
+    `🪑 **Fillers [${fillers.length}]:** ${formatInlineRow(fillers, true)}`;
 
   const embedColor = parseHexColor(event.color_hex) ?? 0x5865f2;
   const effectiveImage = resolveEventImage(event.title, event.image_url);
@@ -1133,9 +1140,9 @@ function buildEventPayload(eventId, includePublishPing = false, guild = null) {
     .setTitle(event.title)
     .setDescription(
       `${event.description}\n\n` +
-      `📅 **When:** <t:${event.start_unix}:F> (<t:${event.start_unix}:R>)\n\n` +
-      `👑 **Host:** <@${event.host_id}>\n\n` +
-      `📚 **New to this activity?** Check out <#${GUIDES_CHANNEL_ID}> ([Open Link](${GUIDES_CHANNEL_URL}))\n\u200b`
+      `📅 **When:** <t:${event.start_unix}:F> (<t:${event.start_unix}:R>)\n` +
+      `👑 **Host:** <@${event.host_id}>\n` +
+      `📚 **New to this activity?** Check out <#${GUIDES_CHANNEL_ID}> ([Open Link](${GUIDES_CHANNEL_URL}))`
     )
     .addFields(
       {
@@ -1144,20 +1151,13 @@ function buildEventPayload(eventId, includePublishPing = false, guild = null) {
         inline: true,
       },
       {
-        name: `📖 Sherpa [${sherpas.length}]`,
-        value: formatBulletSpaced(sherpas),
+        name: '📖 Sherpa & 🪑 Fillers',
+        value: sherpaAndFillersRow,
         inline: true,
       },
       {
-        name: `🪑 Fillers [${fillers.length}]`,
-        value: formatFillersSpaced(fillers),
-        inline: true,
-      },
-      {
-        name: '\u200b',
-        value: `🚫 **Backed-out [${backedOut.length}]**\n\n${
-          backedOut.length > 0 ? backedOut.map((u) => `• <@${u.user_id}>`).join('\n\n') : '*None*'
-        }`,
+        name: `🚫 Backed-out [${backedOut.length}]`,
+        value: formatInlineRow(backedOut),
         inline: false,
       }
     )
@@ -1211,6 +1211,104 @@ function buildEventPayload(eventId, includePublishPing = false, guild = null) {
   }
 
   return { content, allowedMentions, embeds: [embed], components: [signupRow, manageRow] };
+}
+
+function buildCreateEventPromptPayload() {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(CREATE_EVENT_BUTTON_ID)
+      .setLabel('Create Event')
+      .setEmoji('➕')
+      .setStyle(ButtonStyle.Success)
+  );
+
+  return {
+    content: 'Want to host a run? Click below to create an event:',
+    components: [row],
+  };
+}
+
+async function refreshCreateEventPromptAtBottom(client, channelId, guild = null) {
+  if (!channelId) return;
+
+  if (!hasEventsInChannel(channelId)) {
+    const existingPromptId = channelPromptMessages.get(channelId);
+    if (existingPromptId) {
+      const channel = await client.channels.fetch(channelId).catch(() => null);
+      if (channel?.isTextBased()) {
+        const oldPrompt = await channel.messages.fetch(existingPromptId).catch(() => null);
+        if (oldPrompt) await oldPrompt.delete().catch(() => {});
+      }
+      channelPromptMessages.delete(channelId);
+    }
+    return;
+  }
+
+  const channel =
+    guild?.channels?.cache.get(channelId) ??
+    (await client.channels.fetch(channelId).catch(() => null));
+  if (!channel || !channel.isTextBased()) return;
+
+  const existingPromptId = channelPromptMessages.get(channelId);
+  if (existingPromptId) {
+    const oldPrompt = await channel.messages.fetch(existingPromptId).catch(() => null);
+    if (oldPrompt) await oldPrompt.delete().catch(() => {});
+    channelPromptMessages.delete(channelId);
+  }
+
+  const promptMsg = await channel.send(buildCreateEventPromptPayload()).catch(() => null);
+  if (promptMsg) {
+    channelPromptMessages.set(channelId, promptMsg.id);
+  }
+}
+
+// Descending order by start_unix: latest start time at top, soonest start time at bottom
+async function reorderChannelEventsDescending(client, channelId, guild = null, publishEventId = null) {
+  if (!channelId) return;
+
+  const prevTask = channelSortQueues.get(channelId) ?? Promise.resolve();
+  const nextTask = prevTask.catch(() => {}).then(async () => {
+    const store = loadStore();
+    const channelEvents = Object.values(store.events)
+      .filter((ev) => ev.channel_id === channelId)
+      .sort((a, b) => b.start_unix - a.start_unix || a.created_at - b.created_at);
+
+    if (channelEvents.length === 0) {
+      await refreshCreateEventPromptAtBottom(client, channelId, guild);
+      return;
+    }
+
+    const channel =
+      guild?.channels?.cache.get(channelId) ??
+      (await client.channels.fetch(channelId).catch(() => null));
+    if (!channel || !channel.isTextBased()) return;
+
+    const resolvedGuild = guild ?? channel.guild ?? null;
+
+    // Delete existing event messages so they can be re-posted in descending start_unix order
+    for (const ev of channelEvents) {
+      if (ev.message_id) {
+        const oldMsg = await channel.messages.fetch(ev.message_id).catch(() => null);
+        if (oldMsg) await oldMsg.delete().catch(() => {});
+      }
+    }
+
+    for (const ev of channelEvents) {
+      const shouldIncludePing = Boolean(publishEventId && ev.id === publishEventId);
+      const payload = buildEventPayload(ev.id, shouldIncludePing, resolvedGuild);
+      if (!payload) continue;
+
+      const newMsg = await channel.send(payload).catch(() => null);
+      if (newMsg) {
+        setEventMessageAndThread(ev.id, newMsg.id, undefined);
+      }
+    }
+
+    await refreshCreateEventPromptAtBottom(client, channelId, resolvedGuild);
+  });
+
+  channelSortQueues.set(channelId, nextTask);
+  await nextTask;
 }
 
 async function syncEventThread(client, eventId) {
@@ -1312,15 +1410,33 @@ async function createThreadAndNotifyAt15Min(client, eventId) {
 // 5. DISCORD CLIENT & INTERACTION HANDLERS
 // ============================================================================
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
 });
 
 client.on('error', (err) => {
   console.error('Discord client error:', err);
 });
 
-client.once(Events.ClientReady, (readyClient) => {
+client.on(Events.MessageCreate, async (message) => {
+  if (!message.guild || !message.channel?.isTextBased()) return;
+  if (message.author.id === client.user.id) return;
+  if (!hasEventsInChannel(message.channel.id)) return;
+
+  await refreshCreateEventPromptAtBottom(client, message.channel.id, message.guild);
+});
+
+client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
+
+  const store = loadStore();
+  const activeChannelIds = new Set(
+    Object.values(store.events)
+      .map((ev) => ev.channel_id)
+      .filter(Boolean)
+  );
+  for (const chId of activeChannelIds) {
+    await reorderChannelEventsDescending(client, chId);
+  }
 
   setInterval(async () => {
     const nowUnix = Math.floor(Date.now() / 1000);
@@ -1336,6 +1452,12 @@ client.once(Events.ClientReady, (readyClient) => {
 client.on(Events.InteractionCreate, async (interaction) => {
   // /event -> opens details modal
   if (interaction.isChatInputCommand() && interaction.commandName === 'event') {
+    await interaction.showModal(buildEventDetailsModal());
+    return;
+  }
+
+  // Quick "Create Event" button at bottom of channel -> opens details modal
+  if (interaction.isButton() && interaction.customId === CREATE_EVENT_BUTTON_ID) {
     await interaction.showModal(buildEventDetailsModal());
     return;
   }
@@ -1384,14 +1506,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         accepted_cap: acceptedCap,
       });
 
-      const updatedPayload = buildEventPayload(targetId, false, interaction.guild);
-      const channel = await client.channels.fetch(data.event.channel_id).catch(() => null);
-      if (channel?.isTextBased() && data.event.message_id && updatedPayload) {
-        const eventMsg = await channel.messages.fetch(data.event.message_id).catch(() => null);
-        if (eventMsg) await eventMsg.edit(updatedPayload).catch(() => {});
-      }
+      await reorderChannelEventsDescending(client, data.event.channel_id, interaction.guild);
 
-      await interaction.reply({ content: '✅ Event updated!', flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: '✅ Event updated and reordered!', flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -1663,9 +1780,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         created_at: Math.floor(Date.now() / 1000),
       });
 
-      const payload = buildEventPayload(eventId, true, interaction.guild);
-      const msg = await channel.send(payload);
-      setEventMessageAndThread(eventId, msg.id, null);
+      await reorderChannelEventsDescending(client, draft.channelId, interaction.guild, eventId);
 
       await interaction.update({
         content: `✅ Published **${draft.title}**!`,
@@ -1767,6 +1882,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await eventMsg.delete().catch(() => {});
         }
       }
+
+      await refreshCreateEventPromptAtBottom(client, removed.channel_id, interaction.guild);
 
       await interaction.update({
         content: `🗑️ Deleted **${removed.title}**.`,
